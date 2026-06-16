@@ -55,8 +55,9 @@ RB
 FILES="a.rb b.rb app.rb"
 
 write_v1
-# V1 must be green so the snapshot is trustworthy.
-sorbet $FILES >/dev/null 2>err_v1.txt
+# V1 must be green so the snapshot is trustworthy. --no-error-count suppresses the
+# "No errors! Great job." success summary so a green run leaves stderr empty.
+sorbet --no-error-count $FILES >/dev/null 2>err_v1.txt
 if [ -s err_v1.txt ]; then echo "V1 corpus should be green" >&2; cat err_v1.txt >&2; exit 1; fi
 
 # Build the LSP-flavored (Normal-files) snapshot from V1.
@@ -166,7 +167,7 @@ cat > b.rb <<'RB'
 this is deliberately corrupt @@@ ###
 RB
 set +e
-sorbet --load-state s.sym,s.name,s.file --load-state-dirty a.rb $FILES >/dev/null 2>incr.txt; iex=$?
+sorbet --no-error-count --load-state s.sym,s.name,s.file --load-state-dirty a.rb $FILES >/dev/null 2>incr.txt; iex=$?
 set -e
 if [ "$iex" != "0" ] || [ -s incr.txt ]; then
   echo "[read-elision] corrupt unchanged b.rb should have been elided (stay green)" >&2
