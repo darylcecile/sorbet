@@ -1,0 +1,46 @@
+#!/bin/bash
+# Phase 4 DRAFT — REPLACES github/github's .vscode/run-sorbet
+#
+# Original:
+#   thread_count=$(expr $(nproc) / 2)
+#   mkdir -p tmp/sorbet && bin/bundle exec srb typecheck --max-threads $thread_count --cache-dir tmp/sorbet $@
+#
+# The Sorbet VS Code extension launches this with `--lsp` (see .vscode/settings.json
+# sorbet.lspConfigs[].command = [".vscode/run-sorbet", "--lsp"]). We keep that contract
+# and, when a load-state snapshot is present, boot the fork binary from it instead of
+# re-indexing the whole monorepo.
+#
+# The snapshot is built (and baked into the prebuild image) by
+# .devcontainer/build-loadstate-snapshot.sh during on-create. If it's absent for ANY
+# reason, we fall straight through to the stock gem path — never a regression.
+set -e
+
+REPO=/workspaces/github
+thread_count=$(expr "$(nproc)" / 2)
+CACHE_DIR=$REPO/tmp/sorbet
+SNAP_DIR=$REPO/tmp/sorbet/loadstate
+SORBET_BIN=${SORBET_BIN:-$REPO/vendor/sorbet-loadstate/sorbet}
+mkdir -p "$CACHE_DIR"
+
+# Use the snapshot only if every blob + the meta + the fork binary are present.
+if [[ -f "$SNAP_DIR/state.sym" && -f "$SNAP_DIR/state.name" && \
+      -f "$SNAP_DIR/state.file" && -f "$SNAP_DIR/state.meta" && -x "$SORBET_BIN" ]]; then
+  # @sorbet/config provides --dir=. and the --ignore set.
+  #
+  # --disable-watchman: we own the file-change source. The git dirty set computed at
+  #   boot (working tree vs the snapshot's pinned commit) covers everything changed
+  #   since the prebuild; didOpen/didChange cover live edits. Watchman's fresh-instance
+  #   initial sync would list ALL files and defeat the read-elision win, so we skip it.
+  # --load-state-meta drives computeDirtySet -> InitFromSnapshot (or clean fallback to a
+  #   full boot if the pin is incompatible / base commit missing / delta over cap).
+  exec "$SORBET_BIN" \
+    --max-threads "$thread_count" \
+    --cache-dir "$CACHE_DIR" \
+    --disable-watchman \
+    --load-state "$SNAP_DIR/state.sym,$SNAP_DIR/state.name,$SNAP_DIR/state.file" \
+    --load-state-meta "$SNAP_DIR/state.meta" \
+    "$@"
+fi
+
+# No snapshot (or no fork binary): stock behavior, unchanged.
+exec bin/bundle exec srb typecheck --max-threads "$thread_count" --cache-dir "$CACHE_DIR" "$@"

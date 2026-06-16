@@ -1,4 +1,5 @@
 #include "payload/payload.h"
+#include "common/FileOps.h"
 #include "common/timers/Timer.h"
 #include "core/serialize/serialize.h"
 #include "payload/binary/binary.h"
@@ -12,6 +13,24 @@ void createInitialGlobalState(core::GlobalState &gs, const realmain::options::Op
                               const unique_ptr<const OwnedKeyValueStore> &kvstore) {
     if (options.cacheSensitiveOptions.noStdlib) {
         gs.initEmpty();
+        return;
+    }
+
+    if (!options.loadState.empty()) {
+        // Load a previously stored, fully-resolved GlobalState snapshot (sym/name/file tables) from disk, instead of
+        // the compiled-in payload. Unlike the compiled-in payload, this snapshot can contain an entire repo's worth of
+        // resolved symbols, so the PAYLOAD_MAX_* ENFORCEs below (which are sized for the stdlib payload) intentionally
+        // do not run on this path. The kvstore name-table-diff block is also skipped: the snapshot already carries the
+        // complete name table, so there is nothing for the cache to extend.
+        ENFORCE(options.loadState.size() == 3);
+        Timer timeit(gs.tracer(), "read_global_state.load_state");
+        auto symbolTableData = FileOps::read(options.loadState[0]);
+        auto nameTableData = FileOps::read(options.loadState[1]);
+        auto fileTableData = FileOps::read(options.loadState[2]);
+        core::serialize::Serializer::loadGlobalState(gs,
+                                                     reinterpret_cast<const uint8_t *>(symbolTableData.data()),
+                                                     reinterpret_cast<const uint8_t *>(nameTableData.data()),
+                                                     reinterpret_cast<const uint8_t *>(fileTableData.data()));
         return;
     }
 

@@ -233,6 +233,33 @@ optional<unique_ptr<core::GlobalState>> LSPLoop::runLSP(shared_ptr<LSPInput> inp
             logger->debug("Reader thread terminating");
         });
 
+    // Phase 3 (issue #1): when realmain trusted a --load-state snapshot, the typechecker adopts the loaded
+    // resolved GlobalState without re-indexing the workspace. The files that changed since the snapshot was
+    // built (computed in realmain: git dirty set or an explicit --load-state-dirty) still need to be brought
+    // up to date. We replay them here as a single synthetic Watchman file-change once LSP initialization
+    // completes, so they flow through the exact same indexer -> fast/slow path as any other external edit
+    // (downstream-dependency handling and the structural-change slow path come for free). Every unchanged
+    // file is trusted from the snapshot and never read -- that elision is the win. With an empty dirty set
+    // (e.g. a Codespace booting at the exact prebuild commit) there is nothing to replay and we do no work.
+    unique_ptr<Joinable> loadStateBootThread;
+    if (opts.loadStateInitFromSnapshot && !opts.loadStateBootDirty.empty()) {
+        loadStateBootThread = runInAThread(
+            "lspLoadStateBootSync",
+            [&messageQueue, &messageQueueMutex, &initializedNotification, logger = logger,
+             dirty = opts.loadStateBootDirty]() mutable {
+                // Don't enqueue file changes until LSP is initialized (mirrors WatchmanProcess).
+                initializedNotification.WaitForNotification();
+                auto params = make_unique<WatchmanQueryResponse>("", "", false, move(dirty));
+                auto notification =
+                    make_unique<NotificationMessage>("2.0", LSPMethod::SorbetWatchmanFileChange, move(params));
+                auto msg = make_unique<LSPMessage>(move(notification));
+                absl::MutexLock lck(&messageQueueMutex);
+                msg->tagNewRequest(*logger);
+                messageQueue.counters = mergeCounters(move(messageQueue.counters));
+                messageQueue.pendingRequests.push_back(move(msg));
+            });
+    }
+
     // Bridges the gap between the {reader, watchman} threads and the typechecking thread.
     auto preprocessingThread = preprocessor.runPreprocessor(messageQueue, messageQueueMutex);
 

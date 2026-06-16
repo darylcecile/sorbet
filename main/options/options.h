@@ -169,6 +169,44 @@ struct Options {
     size_t maxCacheSizeBytes = MAX_CACHE_SIZE_BYTES;
     UnorderedMap<std::string, core::StrictLevel> strictnessOverrides;
     std::vector<std::string> storeState;
+    // When true (set via --store-state-lsp), the --store-state snapshot keeps workspace files as
+    // File::Type::Normal instead of marking them Payload. This produces an "LSP-flavored" snapshot
+    // whose files are ordinary, editable, re-indexable files on load (the substrate Phase 3 needs),
+    // rather than files that readFileWithStrictnessOverrides silently skips. Only meaningful together
+    // with --store-state.
+    bool storeStateForLsp = false;
+    // Path to a sidecar metadata file written alongside a --store-state snapshot, pinning it to the
+    // Sorbet version, cache-sensitive options, and source git commit it was produced from. Consumed at
+    // load time via --load-state-meta to (a) refuse incompatible snapshots and (b) tell Phase 3 which
+    // commit to diff the working tree against. See main/load_state/SnapshotMeta.h.
+    std::string storeStateMeta;
+    // The source commit recorded in the --store-state-meta sidecar. When empty at store time, Sorbet
+    // attempts to read it from `git rev-parse HEAD` in the working directory.
+    std::string snapshotCommit;
+    std::vector<std::string> loadState;
+    // Path to the sidecar metadata file (see storeStateMeta) to validate when loading a snapshot via
+    // --load-state. On a version/options mismatch the load is refused; the recorded commit is used as
+    // the base for the Phase 3 dirty-set computation.
+    std::string loadStateMeta;
+    // Phase 3 spike: the known-changed subset of input files (comma-separated paths), relative to the
+    // snapshot loaded via --load-state. When set, the incremental-from-snapshot batch path reads and
+    // re-indexes ONLY these files and trusts every other input file as unchanged (eliding its disk read
+    // entirely). When empty, the incremental path falls back to detecting dirty files by comparing each
+    // input's on-disk content to the snapshot (correct, but reads every file). Completeness of this set
+    // is the caller's responsibility (in production, the git dirty-set oracle + content-hash guard).
+    std::vector<std::string> loadStateDirty;
+    // Phase 3 (issue #1), LSP boot: set at startup (NOT a CLI flag) when a --load-state snapshot is
+    // paired with a usable dirty set — either an explicit --load-state-dirty list or one computed from
+    // the --load-state-meta git pin. When true, the LSP typechecker adopts the loaded resolved
+    // GlobalState without re-indexing the workspace (LSPTypechecker::initializeFromSnapshot) and only
+    // the files in loadStateBootDirty are re-synced from disk at boot. Left false (today's full
+    // slow-path init, no regression) whenever the snapshot can't be trusted; in that case realmain
+    // declines to load the snapshot at all so the normal payload boot runs unchanged.
+    bool loadStateInitFromSnapshot = false;
+    // Repo-root-relative paths to re-sync from disk at LSP boot when loadStateInitFromSnapshot is true.
+    // Fed through the existing watchman-style edit path so changed files re-index + re-resolve while
+    // every unchanged file is trusted from the snapshot.
+    std::vector<std::string> loadStateBootDirty;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";
     bool ruby3KeywordArgs = false;

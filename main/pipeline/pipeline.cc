@@ -571,7 +571,7 @@ ast::ExpressionPtr readFileWithStrictnessOverrides(core::GlobalState &gs, core::
     // Returns nullptr if tree is not in cache.
     auto ast = fetchTreeFromCache(gs, file, fileData, kvstore);
 
-    if (!opts.storeState.empty()) {
+    if (!opts.storeState.empty() && !opts.storeStateForLsp) {
         fileData.sourceType = core::File::Type::PayloadGeneration;
     }
 

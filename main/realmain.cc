@@ -19,17 +19,22 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/strip.h"
 #include "common/FileOps.h"
+#include "common/Subprocess.h"
 #include "common/concurrency/Parallel.h"
 #include "common/timers/Timer.h"
 #include "core/Error.h"
 #include "core/ErrorQueue.h"
 #include "core/Files.h"
+#include "core/FileHash.h"
 #include "core/Unfreeze.h"
 #include "core/errors/errors.h"
 #include "core/serialize/serialize.h"
 #include "hashing/hashing.h"
 #include "main/cache/cache.h"
+#include "main/load_state/DirtySet.h"
+#include "main/load_state/SnapshotMeta.h"
 #include "main/pipeline/pipeline.h"
 #include "main/realmain.h"
 #include "packager/GenPackages.h"
@@ -195,6 +200,175 @@ void addInlineInput(const string &input, const string &filename, vector<core::Fi
     }
     auto file = gs.enterFile(filename, modifiedInput);
     inputFiles.emplace_back(file);
+}
+
+enum class IncrementalFromSnapshotResult {
+    // Re-typechecked the changed files incrementally from the snapshot; the batch pipeline should be skipped.
+    Done,
+    // The change set relative to the snapshot can't be applied incrementally (structural change, a new or
+    // removed file, or an unhashable file). The caller must fall back to a cold boot.
+    DeclinedNeedsCold,
+};
+
+// Phase 3 spike: incrementally re-typecheck a workspace from a --load-state snapshot (issue #1).
+//
+// Precondition: createInitialGlobalState already loaded a fully-resolved GlobalState from the snapshot, so
+// `gs` already holds every workspace file (Type::Normal, carrying its snapshot FileHash) plus the stdlib
+// payload (Type::Payload). Snapshots are green (store-state requires a clean run), so every UNCHANGED
+// workspace file is already error-free in the loaded state and needs no re-typechecking.
+//
+// We re-typecheck ONLY files that changed relative to the snapshot, and only when each change is body-local
+// (its symbol table is byte-identical to the snapshot's => no other file can depend on the change). Any
+// symbol-table change (which could require re-typechecking downstream callers — the LSP fast path's
+// fastPathFilesToTypecheck territory), any new or removed file, or an unhashable file, declines so the
+// caller falls back to a cold boot. This keeps the emitted errors identical to a cold run by construction:
+// unchanged files reuse the snapshot's (green) result; body-only-changed files are fully re-typechecked
+// against the same resolved GlobalState a cold run would have produced.
+//
+// NOTE: this batch path proves the incremental algorithm is correct (identical errors). It does NOT itself
+// realize the headline read-elision speedup unless --load-state-dirty supplies the changed set out of band
+// (otherwise it reads every input to detect changes). The headline win — skipping the read of the unchanged
+// tree using a cheap git dirty-set oracle — lands at the LSP InitFromSnapshot seam (see plan.md).
+IncrementalFromSnapshotResult tryRunIncrementalFromSnapshot(core::GlobalState &gs, const options::Options &opts,
+                                                            absl::Span<const core::FileRef> inputFiles,
+                                                            WorkerPool &workers, spdlog::logger &logger) {
+    Timer timeit(logger, "incremental_from_snapshot");
+
+    UnorderedMap<string_view, core::FileRef> inputByPath;
+    inputByPath.reserve(inputFiles.size());
+    for (auto fref : inputFiles) {
+        inputByPath[fref.data(gs).path()] = fref;
+    }
+
+    // A workspace file present in the snapshot but absent from the inputs is a removal/omission, which
+    // changes the symbol hierarchy. We can't trust the loaded state for it => cold boot.
+    for (auto &f : gs.getFiles().subspan(1)) {
+        if (f == nullptr || f->sourceType != core::File::Type::Normal) {
+            continue; // stdlib payload file or hole
+        }
+        if (!inputByPath.contains(f->path())) {
+            logger.info("--load-state: snapshot file `{}` is missing from the inputs (removed/omitted); "
+                        "a cold boot is required.",
+                        f->path());
+            return IncrementalFromSnapshotResult::DeclinedNeedsCold;
+        }
+    }
+
+    // When --load-state-dirty is supplied, trust it as the exact changed set and never read the other
+    // (unchanged) files. Otherwise, detect changes by comparing each input's on-disk content to the snapshot.
+    optional<UnorderedSet<string_view>> dirtyAllowList;
+    if (!opts.loadStateDirty.empty()) {
+        dirtyAllowList.emplace();
+        for (auto &p : opts.loadStateDirty) {
+            dirtyAllowList->insert(p);
+        }
+    }
+
+    struct DirtyFile {
+        core::FileRef fref;
+        shared_ptr<core::File> newFile;
+    };
+    vector<DirtyFile> dirtyFiles;
+
+    for (auto fref : inputFiles) {
+        auto &fileData = fref.data(gs);
+        if (fileData.sourceType == core::File::Type::NotYetRead) {
+            // A path not present in the snapshot adds symbols => hierarchy change => cold boot.
+            logger.info("--load-state: input file `{}` is not in the snapshot (new file); a cold boot is required.",
+                        fileData.path());
+            return IncrementalFromSnapshotResult::DeclinedNeedsCold;
+        }
+
+        bool isDirty;
+        string newSource;
+        if (dirtyAllowList.has_value()) {
+            isDirty = dirtyAllowList->contains(fileData.path());
+            if (isDirty) {
+                newSource = FileOps::read(string(fileData.path()));
+            }
+        } else {
+            newSource = FileOps::read(string(fileData.path()));
+            isDirty = newSource != fileData.source();
+        }
+        if (!isDirty) {
+            // Unchanged: reuse the snapshot's (green) result and elide the file entirely.
+            continue;
+        }
+
+        // Compute the changed file's NEW FileHash on a standalone File (does not mutate `gs`).
+        auto newFile = make_shared<core::File>(string(fileData.path()), move(newSource), core::File::Type::Normal);
+        vector<shared_ptr<core::File>> toHash{newFile};
+        hashing::Hashing::computeFileHashes(absl::Span<const shared_ptr<core::File>>(toHash.data(), toHash.size()),
+                                            logger, workers, opts);
+
+        const auto &oldHash = fileData.getFileHash();
+        const auto &newHash = newFile->getFileHash();
+        if (oldHash == nullptr || newHash == nullptr) {
+            logger.info("--load-state: could not hash `{}` (missing snapshot hash or parse failure); "
+                        "a cold boot is required.",
+                        fileData.path());
+            return IncrementalFromSnapshotResult::DeclinedNeedsCold;
+        }
+
+        // If the changed file has parse/desugar (index) errors, decline. A cold run flushes a file's index
+        // errors together with its later (inference) errors in one batch; the incremental path below flushes
+        // them in separate batches, so the same diagnostics could print in a different order. Declining keeps
+        // the incremental path's output byte-identical to cold by construction. (computeFileHashes ran indexOne
+        // on `newFile`, so this flag already reflects the new content.)
+        if (newFile->hasIndexErrors()) {
+            logger.info("--load-state: changed file `{}` has parse errors; a cold boot is required.",
+                        fileData.path());
+            return IncrementalFromSnapshotResult::DeclinedNeedsCold;
+        }
+
+        const auto &oldLocal = oldHash->localSymbolTableHashes;
+        const auto &newLocal = newHash->localSymbolTableHashes;
+        bool bodyOnly = oldLocal.hierarchyHash == newLocal.hierarchyHash &&
+                        oldLocal.retypecheckableSymbolHashes == newLocal.retypecheckableSymbolHashes;
+        if (!bodyOnly) {
+            // A symbol changed: downstream callers may need re-typechecking (handled in LSP via
+            // fastPathFilesToTypecheck; out of scope for this batch spike) => cold boot.
+            logger.info("--load-state: changed file `{}` alters the symbol table; a cold boot is required to "
+                        "re-typecheck dependents.",
+                        fileData.path());
+            return IncrementalFromSnapshotResult::DeclinedNeedsCold;
+        }
+
+        dirtyFiles.push_back(DirtyFile{fref, move(newFile)});
+    }
+
+    logger.debug("--load-state: incremental from snapshot — {} changed file(s) re-typechecked, {} unchanged "
+                 "file(s) elided",
+                 dirtyFiles.size(), inputFiles.size() - dirtyFiles.size());
+
+    if (dirtyFiles.empty()) {
+        // Nothing changed => the snapshot's (green) result already holds for every input; no errors to emit.
+        return IncrementalFromSnapshotResult::Done;
+    }
+
+    // Apply the changes, mirroring LSPTypechecker::runFastPath's incremental-namer pattern: replace each
+    // changed file, seed the namer with its OLD FileHash (so stale symbols are evicted and re-entered),
+    // re-index, then incrementally resolve and typecheck just these files.
+    UnorderedMap<core::FileRef, shared_ptr<const core::FileHash>> oldFoundHashesForFiles;
+    oldFoundHashesForFiles.reserve(dirtyFiles.size());
+    vector<ast::ParsedFile> updatedIndexed;
+    updatedIndexed.reserve(dirtyFiles.size());
+    for (auto &dirty : dirtyFiles) {
+        auto oldFile = gs.replaceFile(dirty.fref, move(dirty.newFile));
+        oldFoundHashesForFiles.emplace(dirty.fref, oldFile->getFileHash());
+        dirty.fref.data(gs).strictLevel = pipeline::decideStrictLevel(gs, dirty.fref, opts);
+        updatedIndexed.emplace_back(pipeline::indexOne(opts, gs, dirty.fref));
+    }
+
+    optional<UnorderedMap<core::FileRef, shared_ptr<const core::FileHash>>> seededHashes(move(oldFoundHashesForFiles));
+    auto resolved = pipeline::incrementalResolve(gs, move(updatedIndexed), move(seededHashes), opts, workers);
+    pipeline::sortBySize(gs, resolved);
+    // typecheck flushes errors per-file (consistent single-threaded ordering); the caller's final
+    // flushAllErrors/flushErrorCount then reports counts exactly as the cold batch path does.
+    pipeline::typecheck(gs, move(resolved), opts, workers, /*cancelable*/ false, core::packages::Stratum(0),
+                        /*preemptionManager*/ nullptr, /*intentionallyLeakASTs*/ false);
+
+    return IncrementalFromSnapshotResult::Done;
 }
 
 #ifdef SORBET_REALMAIN_MIN
@@ -491,6 +665,71 @@ int realmain(int argc, char *argv[]) {
 
     logger->trace("building initial global state");
 
+    std::optional<load_state::SnapshotMeta> loadStateMetaParsed;
+    if (!opts.loadStateMeta.empty()) {
+        // Validate the snapshot's sidecar pin BEFORE loading it: a resolved GlobalState produced by an
+        // incompatible Sorbet build or option set must never be trusted (mirrors the cache validity key
+        // in main/cache/cache.cc).
+        auto metaData = FileOps::read(opts.loadStateMeta.c_str());
+        auto meta = load_state::SnapshotMeta::parse(metaData);
+        if (!meta.has_value()) {
+            logger->error("--load-state-meta: could not parse snapshot metadata file `{}`", opts.loadStateMeta);
+            return 1;
+        }
+        if (!meta->isCompatibleWith(sorbet_full_version_string, opts.cacheSensitiveOptions.serialize())) {
+            logger->error("--load-state-meta: snapshot is incompatible with this Sorbet build (snapshot version "
+                          "`{}` / options `{}` vs current version `{}` / options `{}`). Refusing to load a stale "
+                          "snapshot.",
+                          meta->sorbetVersion, static_cast<uint32_t>(meta->cacheSensitiveOptions),
+                          sorbet_full_version_string, static_cast<uint32_t>(opts.cacheSensitiveOptions.serialize()));
+            return 1;
+        }
+        logger->debug("--load-state-meta: snapshot is compatible (base commit {})",
+                      meta->gitSha.empty() ? "<none>" : meta->gitSha);
+        loadStateMetaParsed = move(meta);
+    }
+
+    // Phase 3 (issue #1): for an LSP boot, decide whether the loaded snapshot can be trusted so we re-sync
+    // only the files that changed since it was built, instead of re-indexing the whole workspace (the 35.7s
+    // index measured at github/github scale). This requires a usable dirty set: either an explicit
+    // --load-state-dirty list, or one computed by diffing the working tree against the snapshot's pinned
+    // base commit (--load-state-meta). When neither is available/usable we decline to load the snapshot
+    // entirely and fall back to the normal full boot (no regression) — we must not trust the snapshot
+    // without knowing the delta, and we must not re-run the slow path over an already-resolved GlobalState
+    // (that would double-define every workspace symbol).
+    if (opts.runLSP && !opts.loadState.empty() && !opts.packageDirected &&
+        !opts.cacheSensitiveOptions.sorbetPackages) {
+        // If more than this many files changed, the snapshot buys little over a full index, so fall back.
+        constexpr size_t maxDirtyFiles = 25000;
+        if (!opts.loadStateDirty.empty()) {
+            // Explicit dirty set (out-of-band change detection / tests). Trust it verbatim.
+            opts.loadStateInitFromSnapshot = true;
+            opts.loadStateBootDirty = opts.loadStateDirty;
+            logger->debug("--load-state: trusting snapshot via explicit --load-state-dirty ({} file(s))",
+                          opts.loadStateBootDirty.size());
+        } else if (loadStateMetaParsed.has_value()) {
+            const std::string &repoRoot = opts.rawInputDirNames.empty() ? "." : opts.rawInputDirNames[0];
+            auto dirty = load_state::computeDirtySet(*loadStateMetaParsed, repoRoot, maxDirtyFiles);
+            if (dirty.usable) {
+                opts.loadStateInitFromSnapshot = true;
+                opts.loadStateBootDirty = move(dirty.paths);
+                logger->debug("--load-state: trusting snapshot; {} dirty file(s) to re-sync at boot",
+                              opts.loadStateBootDirty.size());
+            } else {
+                logger->warn("--load-state: cannot trust snapshot ({}); falling back to a full index "
+                             "(no regression).",
+                             dirty.fallbackReason);
+                opts.loadState.clear();
+                opts.loadStateMeta.clear();
+            }
+        } else {
+            logger->warn("--load-state without --load-state-meta or --load-state-dirty: cannot determine "
+                         "which files changed since the snapshot; falling back to a full index (no "
+                         "regression).");
+            opts.loadState.clear();
+        }
+    }
+
     unique_ptr<const OwnedKeyValueStore> kvstore = cache::maybeCreateKeyValueStore(logger, opts);
     payload::createInitialGlobalState(*gs, opts, kvstore);
     pipeline::setGlobalStateOptions(*gs, opts);
@@ -605,6 +844,25 @@ int realmain(int argc, char *argv[]) {
 
         auto inputFilesSpan = absl::Span<core::FileRef>(inputFiles);
 
+        // Phase 3 spike: when a fully-resolved snapshot was loaded via --load-state, try to re-typecheck
+        // only the files that changed relative to it, trusting the (green) snapshot for everything else,
+        // instead of running the full index+name+resolve+typecheck pipeline below. Restricted to the plain
+        // batch case (no packages, no --store-state, no inline input, no gen-packages); on a structural or
+        // ambiguous delta this declines and we require a cold boot rather than risk diverging from cold output.
+        bool ranIncrementalFromSnapshot = false;
+        if (!opts.loadState.empty() && opts.storeState.empty() && !opts.cacheSensitiveOptions.sorbetPackages &&
+            opts.genPackagesMode == core::packages::GenPackagesMode::Disabled && opts.inlineInput.empty() &&
+            opts.inlineRBIInput.empty()) {
+            auto incrResult = tryRunIncrementalFromSnapshot(*gs, opts, inputFilesSpan, *workers, *logger);
+            if (incrResult == IncrementalFromSnapshotResult::DeclinedNeedsCold) {
+                logger->error("--load-state: the change set relative to the snapshot requires a cold boot "
+                              "(structural change, a new/removed file, or an unhashable file — see warnings "
+                              "above). Re-run without --load-state to typecheck from scratch.");
+                return 1;
+            }
+            ranIncrementalFromSnapshot = true;
+        }
+
         // ----- build the package DB -----
 
         vector<ast::ParsedFile> packageIndexed;
@@ -652,6 +910,12 @@ int realmain(int argc, char *argv[]) {
         auto strata = pipeline::computePackageStrata(*gs, packageIndexed, inputFilesSpan, opts);
         gs->preallocateForStrata(strata.strata.size());
         for (auto &stratum : strata.strata) {
+            if (ranIncrementalFromSnapshot) {
+                // The incremental-from-snapshot path above already typechecked the changed files; skip the
+                // full pipeline. (The shared tail below — printGlobalTables, flushAllErrors, error count —
+                // still runs for both paths.)
+                break;
+            }
             ++currentStratum;
 
             // We can unconditionally reset (to drop the vectors) instead of having to consult
@@ -854,11 +1118,41 @@ int realmain(int argc, char *argv[]) {
 
         if (!opts.storeState.empty()) {
             ENFORCE(opts.storeState.size() == 3);
-            gs->markAsPayload();
+            // For an LSP-flavored store (--store-state-lsp) we deliberately skip markAsPayload() so that
+            // workspace files remain File::Type::Normal in the snapshot. Marking them Payload would cause
+            // readFileWithStrictnessOverrides (pipeline.cc) to return nullptr for them on load, silently
+            // skipping them so they're never re-indexed or editable. That's correct for the stdlib payload
+            // but fatal for a workspace snapshot, which Phase 3 needs to treat as ordinary files.
+            if (!opts.storeStateForLsp) {
+                gs->markAsPayload();
+            }
             auto result = core::serialize::Serializer::store(*gs);
             FileOps::write(opts.storeState[0].c_str(), result.symbolTableData);
             FileOps::write(opts.storeState[1].c_str(), result.nameTableData);
             FileOps::write(opts.storeState[2].c_str(), result.fileTableData);
+
+            if (!opts.storeStateMeta.empty()) {
+                // Pin the snapshot to the build/options/commit it was produced from so --load-state can
+                // refuse incompatible snapshots and Phase 3 can diff the working tree against this commit.
+                load_state::SnapshotMeta meta;
+                meta.sorbetVersion = sorbet_full_version_string;
+                meta.cacheSensitiveOptions = opts.cacheSensitiveOptions.serialize();
+                meta.gitSha = opts.snapshotCommit;
+                if (meta.gitSha.empty()) {
+                    // No explicit --snapshot-commit: best-effort read of the current HEAD. A missing or
+                    // non-git workspace leaves the SHA empty, which the dirty-set oracle treats as
+                    // "unknown base" and falls back to a full index (no regression).
+                    auto headSha = Subprocess::spawn("git", {"rev-parse", "HEAD"}, std::nullopt);
+                    if (headSha.has_value() && headSha->status == 0) {
+                        meta.gitSha = absl::StripAsciiWhitespace(headSha->output);
+                    } else {
+                        logger->warn("--store-state-meta: could not determine the source git commit "
+                                     "(`git rev-parse HEAD` failed); recording an empty base commit. "
+                                     "--load-state will fall back to a full index.");
+                    }
+                }
+                FileOps::write(opts.storeStateMeta.c_str(), meta.serialize());
+            }
         }
 
         auto untypedBlames = getAndClearHistogram("untyped.blames");

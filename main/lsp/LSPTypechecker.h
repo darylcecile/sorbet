@@ -118,6 +118,15 @@ class LSPTypechecker final {
                                                          std::shared_ptr<core::ErrorFlusher> errorFlusher,
                                                          SlowPathMode mode);
 
+    /**
+     * Phase 3 (issue #1): initialize the typechecker from a fully-resolved `--load-state` snapshot WITHOUT re-running
+     * the index+name+resolve+typecheck pipeline over every input file. The loaded GlobalState already holds every
+     * workspace file (with source + FileHash) and a resolved symbol table, so we only reconstruct the post-slow-path
+     * bookkeeping (workspace file list, strata, session cache, `initialized`). Any files that changed relative to the
+     * snapshot are picked up by a normal edit (the existing fast/slow path), not here.
+     */
+    void initializeFromSnapshot(std::unique_ptr<KeyValueStore> kvstore, const LSPConfiguration &currentConfig);
+
     struct FastPathResult {
         // All of the files that we typechecked during the fast path.
         std::vector<core::FileRef> filesTypechecked;
