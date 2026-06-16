@@ -24,6 +24,7 @@ cc_library(
     }),
     visibility = ["//visibility:public"],
     deps = [
+        "//common",
         "//common/kvstore",
         "//core",
         "//core/serialize",
