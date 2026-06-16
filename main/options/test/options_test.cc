@@ -43,6 +43,7 @@ TEST_CASE("DefaultConstructorMatchesReadOptions") {
     CHECK_EQ(empty.cacheDir, opts.cacheDir);
     CHECK_EQ(empty.strictnessOverrides.size(), opts.strictnessOverrides.size());
     CHECK_EQ(empty.storeState, opts.storeState);
+    CHECK_EQ(empty.storeStateForLsp, opts.storeStateForLsp);
     CHECK_EQ(empty.loadState, opts.loadState);
     CHECK_EQ(empty.enableCounters, opts.enableCounters);
     CHECK_EQ(empty.errorUrlBase, opts.errorUrlBase);

@@ -854,7 +854,14 @@ int realmain(int argc, char *argv[]) {
 
         if (!opts.storeState.empty()) {
             ENFORCE(opts.storeState.size() == 3);
-            gs->markAsPayload();
+            // For an LSP-flavored store (--store-state-lsp) we deliberately skip markAsPayload() so that
+            // workspace files remain File::Type::Normal in the snapshot. Marking them Payload would cause
+            // readFileWithStrictnessOverrides (pipeline.cc) to return nullptr for them on load, silently
+            // skipping them so they're never re-indexed or editable. That's correct for the stdlib payload
+            // but fatal for a workspace snapshot, which Phase 3 needs to treat as ordinary files.
+            if (!opts.storeStateForLsp) {
+                gs->markAsPayload();
+            }
             auto result = core::serialize::Serializer::store(*gs);
             FileOps::write(opts.storeState[0].c_str(), result.symbolTableData);
             FileOps::write(opts.storeState[1].c_str(), result.nameTableData);

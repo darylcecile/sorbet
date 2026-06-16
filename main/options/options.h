@@ -169,6 +169,12 @@ struct Options {
     size_t maxCacheSizeBytes = MAX_CACHE_SIZE_BYTES;
     UnorderedMap<std::string, core::StrictLevel> strictnessOverrides;
     std::vector<std::string> storeState;
+    // When true (set via --store-state-lsp), the --store-state snapshot keeps workspace files as
+    // File::Type::Normal instead of marking them Payload. This produces an "LSP-flavored" snapshot
+    // whose files are ordinary, editable, re-indexable files on load (the substrate Phase 3 needs),
+    // rather than files that readFileWithStrictnessOverrides silently skips. Only meaningful together
+    // with --store-state.
+    bool storeStateForLsp = false;
     std::vector<std::string> loadState;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";

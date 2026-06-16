@@ -719,6 +719,11 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
         "store-state", "Store state into three files, separated by commas: <symbol-table>,<name-table>,<file-table>",
         cxxopts::value<string>()->default_value(""), "file");
     options.add_options(section)(
+        "store-state-lsp",
+        "Modifier for --store-state: keep workspace files as Normal (editable, re-indexable) instead of "
+        "marking them as Payload. Produces an LSP-flavored snapshot for use with --load-state.",
+        cxxopts::value<bool>()->default_value("false"));
+    options.add_options(section)(
         "load-state",
         "Load a previously stored, fully-resolved state from three files, separated by commas: "
         "<symbol-table>,<name-table>,<file-table>. Replaces the compiled-in payload. The snapshot must have been "
@@ -1159,6 +1164,12 @@ void readOptions(Options &opts,
                 logger->error("--store-state must be given three paths, separated by commas");
                 throw EarlyReturnWithCode(1);
             }
+        }
+
+        opts.storeStateForLsp = raw["store-state-lsp"].as<bool>();
+        if (opts.storeStateForLsp && opts.storeState.empty()) {
+            logger->error("--store-state-lsp is only meaningful together with --store-state");
+            throw EarlyReturnWithCode(1);
         }
 
         auto loadStateRaw = raw["load-state"].as<string>();
