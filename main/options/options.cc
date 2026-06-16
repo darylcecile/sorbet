@@ -745,6 +745,13 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
         "Validate the sidecar metadata file written by --store-state-meta when loading a snapshot via "
         "--load-state. Refuses snapshots produced by an incompatible Sorbet version or option set.",
         cxxopts::value<string>()->default_value(""), "file");
+    options.add_options(section)(
+        "load-state-dirty",
+        "Phase 3 spike (with --load-state): comma-separated paths of input files known to have changed "
+        "relative to the snapshot. Only these are read and re-indexed; all other input files are trusted "
+        "as unchanged and their disk read is elided. When omitted, dirty files are detected by comparing "
+        "on-disk content to the snapshot.",
+        cxxopts::value<string>()->default_value(""), "files");
     options.add_options(section)("silence-dev-message", "Silence \"You are running a development build\" message");
     options.add_options(section)("censor-for-snapshot-tests",
                                  "When printing raw location information, don't show line numbers");
@@ -1218,6 +1225,15 @@ void readOptions(Options &opts,
         if (!opts.loadStateMeta.empty() && opts.loadState.empty()) {
             logger->error("--load-state-meta is only meaningful together with --load-state");
             throw EarlyReturnWithCode(1);
+        }
+
+        auto loadStateDirtyRaw = raw["load-state-dirty"].as<string>();
+        if (!loadStateDirtyRaw.empty()) {
+            if (opts.loadState.empty()) {
+                logger->error("--load-state-dirty is only meaningful together with --load-state");
+                throw EarlyReturnWithCode(1);
+            }
+            opts.loadStateDirty = absl::StrSplit(loadStateDirtyRaw, ',', absl::SkipEmpty());
         }
 
         opts.forceHashing = raw["force-hashing"].as<bool>();

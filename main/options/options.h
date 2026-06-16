@@ -188,6 +188,13 @@ struct Options {
     // --load-state. On a version/options mismatch the load is refused; the recorded commit is used as
     // the base for the Phase 3 dirty-set computation.
     std::string loadStateMeta;
+    // Phase 3 spike: the known-changed subset of input files (comma-separated paths), relative to the
+    // snapshot loaded via --load-state. When set, the incremental-from-snapshot batch path reads and
+    // re-indexes ONLY these files and trusts every other input file as unchanged (eliding its disk read
+    // entirely). When empty, the incremental path falls back to detecting dirty files by comparing each
+    // input's on-disk content to the snapshot (correct, but reads every file). Completeness of this set
+    // is the caller's responsibility (in production, the git dirty-set oracle + content-hash guard).
+    std::vector<std::string> loadStateDirty;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";
     bool ruby3KeywordArgs = false;
