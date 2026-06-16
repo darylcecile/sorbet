@@ -718,6 +718,12 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
     options.add_options(section)(
         "store-state", "Store state into three files, separated by commas: <symbol-table>,<name-table>,<file-table>",
         cxxopts::value<string>()->default_value(""), "file");
+    options.add_options(section)(
+        "load-state",
+        "Load a previously stored, fully-resolved state from three files, separated by commas: "
+        "<symbol-table>,<name-table>,<file-table>. Replaces the compiled-in payload. The snapshot must have been "
+        "produced by a binary with an identical version and identical cache-sensitive options.",
+        cxxopts::value<string>()->default_value(""), "file");
     options.add_options(section)("silence-dev-message", "Silence \"You are running a development build\" message");
     options.add_options(section)("censor-for-snapshot-tests",
                                  "When printing raw location information, don't show line numbers");
@@ -1155,9 +1161,24 @@ void readOptions(Options &opts,
             }
         }
 
+        auto loadStateRaw = raw["load-state"].as<string>();
+        if (!loadStateRaw.empty()) {
+            opts.loadState = absl::StrSplit(loadStateRaw, ',');
+            if (opts.loadState.size() != 3) {
+                logger->error("--load-state must be given three paths, separated by commas");
+                throw EarlyReturnWithCode(1);
+            }
+            if (opts.cacheSensitiveOptions.noStdlib) {
+                // --load-state replaces the payload wholesale, so --no-stdlib (which loads no payload) would
+                // silently ignore it. Reject rather than confuse.
+                logger->error("You can't pass both `{}` and `{}`.", "--load-state", "--no-stdlib");
+                throw EarlyReturnWithCode(1);
+            }
+        }
+
         opts.forceHashing = raw["force-hashing"].as<bool>();
 
-        opts.threads = (opts.runLSP || !opts.storeState.empty())
+        opts.threads = (opts.runLSP || !opts.storeState.empty() || !opts.loadState.empty())
                            ? raw["max-threads"].as<int>()
                            : min(raw["max-threads"].as<int>(), int(opts.inputFileNames.size() / 2));
 
@@ -1425,7 +1446,7 @@ void readOptions(Options &opts,
         }
 
         if (raw.count("e") == 0 && raw.count("e-rbi") == 0 && opts.inputFileNames.empty() &&
-            !raw["version"].as<bool>() && !opts.runLSP && opts.storeState.empty() &&
+            !raw["version"].as<bool>() && !opts.runLSP && opts.storeState.empty() && opts.loadState.empty() &&
             !opts.print.PayloadSources.enabled) {
             logger->error("You must pass `{}`, `{}`, or at least one folder or ruby file.\n\n{}", "-e", "--e-rbi",
                           options.help({groupToString(Group::INPUT)}));

@@ -169,6 +169,7 @@ struct Options {
     size_t maxCacheSizeBytes = MAX_CACHE_SIZE_BYTES;
     UnorderedMap<std::string, core::StrictLevel> strictnessOverrides;
     std::vector<std::string> storeState;
+    std::vector<std::string> loadState;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";
     bool ruby3KeywordArgs = false;
