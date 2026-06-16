@@ -195,6 +195,18 @@ struct Options {
     // input's on-disk content to the snapshot (correct, but reads every file). Completeness of this set
     // is the caller's responsibility (in production, the git dirty-set oracle + content-hash guard).
     std::vector<std::string> loadStateDirty;
+    // Phase 3 (issue #1), LSP boot: set at startup (NOT a CLI flag) when a --load-state snapshot is
+    // paired with a usable dirty set — either an explicit --load-state-dirty list or one computed from
+    // the --load-state-meta git pin. When true, the LSP typechecker adopts the loaded resolved
+    // GlobalState without re-indexing the workspace (LSPTypechecker::initializeFromSnapshot) and only
+    // the files in loadStateBootDirty are re-synced from disk at boot. Left false (today's full
+    // slow-path init, no regression) whenever the snapshot can't be trusted; in that case realmain
+    // declines to load the snapshot at all so the normal payload boot runs unchanged.
+    bool loadStateInitFromSnapshot = false;
+    // Repo-root-relative paths to re-sync from disk at LSP boot when loadStateInitFromSnapshot is true.
+    // Fed through the existing watchman-style edit path so changed files re-index + re-resolve while
+    // every unchanged file is trusted from the snapshot.
+    std::vector<std::string> loadStateBootDirty;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";
     bool ruby3KeywordArgs = false;

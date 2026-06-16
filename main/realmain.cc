@@ -33,6 +33,7 @@
 #include "core/serialize/serialize.h"
 #include "hashing/hashing.h"
 #include "main/cache/cache.h"
+#include "main/load_state/DirtySet.h"
 #include "main/load_state/SnapshotMeta.h"
 #include "main/pipeline/pipeline.h"
 #include "main/realmain.h"
@@ -664,6 +665,7 @@ int realmain(int argc, char *argv[]) {
 
     logger->trace("building initial global state");
 
+    std::optional<load_state::SnapshotMeta> loadStateMetaParsed;
     if (!opts.loadStateMeta.empty()) {
         // Validate the snapshot's sidecar pin BEFORE loading it: a resolved GlobalState produced by an
         // incompatible Sorbet build or option set must never be trusted (mirrors the cache validity key
@@ -684,6 +686,48 @@ int realmain(int argc, char *argv[]) {
         }
         logger->debug("--load-state-meta: snapshot is compatible (base commit {})",
                       meta->gitSha.empty() ? "<none>" : meta->gitSha);
+        loadStateMetaParsed = move(meta);
+    }
+
+    // Phase 3 (issue #1): for an LSP boot, decide whether the loaded snapshot can be trusted so we re-sync
+    // only the files that changed since it was built, instead of re-indexing the whole workspace (the 35.7s
+    // index measured at github/github scale). This requires a usable dirty set: either an explicit
+    // --load-state-dirty list, or one computed by diffing the working tree against the snapshot's pinned
+    // base commit (--load-state-meta). When neither is available/usable we decline to load the snapshot
+    // entirely and fall back to the normal full boot (no regression) — we must not trust the snapshot
+    // without knowing the delta, and we must not re-run the slow path over an already-resolved GlobalState
+    // (that would double-define every workspace symbol).
+    if (opts.runLSP && !opts.loadState.empty() && !opts.packageDirected &&
+        !opts.cacheSensitiveOptions.sorbetPackages) {
+        // If more than this many files changed, the snapshot buys little over a full index, so fall back.
+        constexpr size_t maxDirtyFiles = 25000;
+        if (!opts.loadStateDirty.empty()) {
+            // Explicit dirty set (out-of-band change detection / tests). Trust it verbatim.
+            opts.loadStateInitFromSnapshot = true;
+            opts.loadStateBootDirty = opts.loadStateDirty;
+            logger->debug("--load-state: trusting snapshot via explicit --load-state-dirty ({} file(s))",
+                          opts.loadStateBootDirty.size());
+        } else if (loadStateMetaParsed.has_value()) {
+            const std::string &repoRoot = opts.rawInputDirNames.empty() ? "." : opts.rawInputDirNames[0];
+            auto dirty = load_state::computeDirtySet(*loadStateMetaParsed, repoRoot, maxDirtyFiles);
+            if (dirty.usable) {
+                opts.loadStateInitFromSnapshot = true;
+                opts.loadStateBootDirty = move(dirty.paths);
+                logger->debug("--load-state: trusting snapshot; {} dirty file(s) to re-sync at boot",
+                              opts.loadStateBootDirty.size());
+            } else {
+                logger->warn("--load-state: cannot trust snapshot ({}); falling back to a full index "
+                             "(no regression).",
+                             dirty.fallbackReason);
+                opts.loadState.clear();
+                opts.loadStateMeta.clear();
+            }
+        } else {
+            logger->warn("--load-state without --load-state-meta or --load-state-dirty: cannot determine "
+                         "which files changed since the snapshot; falling back to a full index (no "
+                         "regression).");
+            opts.loadState.clear();
+        }
     }
 
     unique_ptr<const OwnedKeyValueStore> kvstore = cache::maybeCreateKeyValueStore(logger, opts);

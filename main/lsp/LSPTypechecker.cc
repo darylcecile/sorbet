@@ -147,14 +147,13 @@ void LSPTypechecker::initialize(TaskQueue &queue, unique_ptr<core::GlobalState> 
         const bool isIncremental = false;
         ErrorEpoch epoch(*errorReporter, updates.epoch, isIncremental, {});
 
-        // Phase 3 (issue #1): when a fully-resolved snapshot was loaded via --load-state, the workspace symbol table
-        // is already populated, so we skip the full index+name+resolve+typecheck of every input file and adopt the
-        // loaded resolved state directly. Files that changed relative to the snapshot are re-typechecked by a normal
-        // edit (the existing fast/slow path) after initialization. Restricted to non-package mode for now; anything
-        // else falls back to the standard slow-path initialization (no behavior change).
-        const bool initFromSnapshot = !currentConfig.opts.loadState.empty() &&
-                                      !currentConfig.opts.packageDirected &&
-                                      !currentConfig.opts.cacheSensitiveOptions.sorbetPackages;
+        // Phase 3 (issue #1): when a fully-resolved snapshot was loaded via --load-state AND realmain confirmed
+        // the delta is trustworthy (loadStateInitFromSnapshot), the workspace symbol table is already populated,
+        // so we skip the full index+name+resolve+typecheck of every input file and adopt the loaded resolved
+        // state directly. Files that changed relative to the snapshot are re-typechecked by a normal edit (the
+        // existing fast/slow path) after initialization. Anything else falls back to the standard slow-path
+        // initialization (no behavior change).
+        const bool initFromSnapshot = currentConfig.opts.loadStateInitFromSnapshot;
         if (initFromSnapshot) {
             initializeFromSnapshot(std::move(kvstore), currentConfig);
         } else {
