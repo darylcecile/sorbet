@@ -19,7 +19,9 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
+#include "absl/strings/strip.h"
 #include "common/FileOps.h"
+#include "common/Subprocess.h"
 #include "common/concurrency/Parallel.h"
 #include "common/timers/Timer.h"
 #include "core/Error.h"
@@ -30,6 +32,7 @@
 #include "core/serialize/serialize.h"
 #include "hashing/hashing.h"
 #include "main/cache/cache.h"
+#include "main/load_state/SnapshotMeta.h"
 #include "main/pipeline/pipeline.h"
 #include "main/realmain.h"
 #include "packager/GenPackages.h"
@@ -491,6 +494,28 @@ int realmain(int argc, char *argv[]) {
 
     logger->trace("building initial global state");
 
+    if (!opts.loadStateMeta.empty()) {
+        // Validate the snapshot's sidecar pin BEFORE loading it: a resolved GlobalState produced by an
+        // incompatible Sorbet build or option set must never be trusted (mirrors the cache validity key
+        // in main/cache/cache.cc).
+        auto metaData = FileOps::read(opts.loadStateMeta.c_str());
+        auto meta = load_state::SnapshotMeta::parse(metaData);
+        if (!meta.has_value()) {
+            logger->error("--load-state-meta: could not parse snapshot metadata file `{}`", opts.loadStateMeta);
+            return 1;
+        }
+        if (!meta->isCompatibleWith(sorbet_full_version_string, opts.cacheSensitiveOptions.serialize())) {
+            logger->error("--load-state-meta: snapshot is incompatible with this Sorbet build (snapshot version "
+                          "`{}` / options `{}` vs current version `{}` / options `{}`). Refusing to load a stale "
+                          "snapshot.",
+                          meta->sorbetVersion, static_cast<uint32_t>(meta->cacheSensitiveOptions),
+                          sorbet_full_version_string, static_cast<uint32_t>(opts.cacheSensitiveOptions.serialize()));
+            return 1;
+        }
+        logger->debug("--load-state-meta: snapshot is compatible (base commit {})",
+                      meta->gitSha.empty() ? "<none>" : meta->gitSha);
+    }
+
     unique_ptr<const OwnedKeyValueStore> kvstore = cache::maybeCreateKeyValueStore(logger, opts);
     payload::createInitialGlobalState(*gs, opts, kvstore);
     pipeline::setGlobalStateOptions(*gs, opts);
@@ -866,6 +891,29 @@ int realmain(int argc, char *argv[]) {
             FileOps::write(opts.storeState[0].c_str(), result.symbolTableData);
             FileOps::write(opts.storeState[1].c_str(), result.nameTableData);
             FileOps::write(opts.storeState[2].c_str(), result.fileTableData);
+
+            if (!opts.storeStateMeta.empty()) {
+                // Pin the snapshot to the build/options/commit it was produced from so --load-state can
+                // refuse incompatible snapshots and Phase 3 can diff the working tree against this commit.
+                load_state::SnapshotMeta meta;
+                meta.sorbetVersion = sorbet_full_version_string;
+                meta.cacheSensitiveOptions = opts.cacheSensitiveOptions.serialize();
+                meta.gitSha = opts.snapshotCommit;
+                if (meta.gitSha.empty()) {
+                    // No explicit --snapshot-commit: best-effort read of the current HEAD. A missing or
+                    // non-git workspace leaves the SHA empty, which the dirty-set oracle treats as
+                    // "unknown base" and falls back to a full index (no regression).
+                    auto headSha = Subprocess::spawn("git", {"rev-parse", "HEAD"}, std::nullopt);
+                    if (headSha.has_value() && headSha->status == 0) {
+                        meta.gitSha = absl::StripAsciiWhitespace(headSha->output);
+                    } else {
+                        logger->warn("--store-state-meta: could not determine the source git commit "
+                                     "(`git rev-parse HEAD` failed); recording an empty base commit. "
+                                     "--load-state will fall back to a full index.");
+                    }
+                }
+                FileOps::write(opts.storeStateMeta.c_str(), meta.serialize());
+            }
         }
 
         auto untypedBlames = getAndClearHistogram("untyped.blames");

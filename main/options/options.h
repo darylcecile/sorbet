@@ -175,7 +175,19 @@ struct Options {
     // rather than files that readFileWithStrictnessOverrides silently skips. Only meaningful together
     // with --store-state.
     bool storeStateForLsp = false;
+    // Path to a sidecar metadata file written alongside a --store-state snapshot, pinning it to the
+    // Sorbet version, cache-sensitive options, and source git commit it was produced from. Consumed at
+    // load time via --load-state-meta to (a) refuse incompatible snapshots and (b) tell Phase 3 which
+    // commit to diff the working tree against. See main/load_state/SnapshotMeta.h.
+    std::string storeStateMeta;
+    // The source commit recorded in the --store-state-meta sidecar. When empty at store time, Sorbet
+    // attempts to read it from `git rev-parse HEAD` in the working directory.
+    std::string snapshotCommit;
     std::vector<std::string> loadState;
+    // Path to the sidecar metadata file (see storeStateMeta) to validate when loading a snapshot via
+    // --load-state. On a version/options mismatch the load is refused; the recorded commit is used as
+    // the base for the Phase 3 dirty-set computation.
+    std::string loadStateMeta;
     bool enableCounters = false;
     std::string errorUrlBase = "https://srb.help/";
     bool ruby3KeywordArgs = false;

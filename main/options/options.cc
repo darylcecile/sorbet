@@ -724,10 +724,26 @@ buildOptions(const vector<pipeline::semantic_extension::SemanticExtensionProvide
         "marking them as Payload. Produces an LSP-flavored snapshot for use with --load-state.",
         cxxopts::value<bool>()->default_value("false"));
     options.add_options(section)(
+        "store-state-meta",
+        "Modifier for --store-state: also write a sidecar metadata file at this path, pinning the snapshot to "
+        "this Sorbet version, its cache-sensitive options, and the source git commit (so --load-state can refuse "
+        "incompatible snapshots and compute an incremental dirty set).",
+        cxxopts::value<string>()->default_value(""), "file");
+    options.add_options(section)(
+        "snapshot-commit",
+        "The source git commit to record in the --store-state-meta sidecar. Defaults to `git rev-parse HEAD` in "
+        "the working directory when omitted.",
+        cxxopts::value<string>()->default_value(""), "sha");
+    options.add_options(section)(
         "load-state",
         "Load a previously stored, fully-resolved state from three files, separated by commas: "
         "<symbol-table>,<name-table>,<file-table>. Replaces the compiled-in payload. The snapshot must have been "
         "produced by a binary with an identical version and identical cache-sensitive options.",
+        cxxopts::value<string>()->default_value(""), "file");
+    options.add_options(section)(
+        "load-state-meta",
+        "Validate the sidecar metadata file written by --store-state-meta when loading a snapshot via "
+        "--load-state. Refuses snapshots produced by an incompatible Sorbet version or option set.",
         cxxopts::value<string>()->default_value(""), "file");
     options.add_options(section)("silence-dev-message", "Silence \"You are running a development build\" message");
     options.add_options(section)("censor-for-snapshot-tests",
@@ -1172,6 +1188,17 @@ void readOptions(Options &opts,
             throw EarlyReturnWithCode(1);
         }
 
+        opts.storeStateMeta = raw["store-state-meta"].as<string>();
+        if (!opts.storeStateMeta.empty() && opts.storeState.empty()) {
+            logger->error("--store-state-meta is only meaningful together with --store-state");
+            throw EarlyReturnWithCode(1);
+        }
+        opts.snapshotCommit = raw["snapshot-commit"].as<string>();
+        if (!opts.snapshotCommit.empty() && opts.storeStateMeta.empty()) {
+            logger->error("--snapshot-commit is only meaningful together with --store-state-meta");
+            throw EarlyReturnWithCode(1);
+        }
+
         auto loadStateRaw = raw["load-state"].as<string>();
         if (!loadStateRaw.empty()) {
             opts.loadState = absl::StrSplit(loadStateRaw, ',');
@@ -1185,6 +1212,12 @@ void readOptions(Options &opts,
                 logger->error("You can't pass both `{}` and `{}`.", "--load-state", "--no-stdlib");
                 throw EarlyReturnWithCode(1);
             }
+        }
+
+        opts.loadStateMeta = raw["load-state-meta"].as<string>();
+        if (!opts.loadStateMeta.empty() && opts.loadState.empty()) {
+            logger->error("--load-state-meta is only meaningful together with --load-state");
+            throw EarlyReturnWithCode(1);
         }
 
         opts.forceHashing = raw["force-hashing"].as<bool>();
