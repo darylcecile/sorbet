@@ -152,11 +152,18 @@ rm -rf /workspaces/github/tmp/sorbet-loadstate /workspaces/github/tmp/tti.json
 (The snapshot + cache live under the gitignored `tmp/`, so they never dirty the repo;
 the `rm` is just housekeeping.)
 
-## 7. Phase 4 — prebuild wiring (after the number lands; needs GHCR creds)
-Apply the drafts in `tmp/phase4/` to a github/github PR: `preindex-sorbet.sh` (PREINDEX
-worker builds the snapshot + `oras push ghcr.io/github/github/sorbet-loadstate-index`),
-the on-create `oras pull`, and the `.vscode/run-sorbet` replacement. Ship the ~246MB
-snapshot only (drop the 465MB kvstore — unchanged files are never re-read at load time).
+## 7. Phase 4 — Codespaces prebuild-bake wiring (after the number lands; NO token)
+Apply the drafts in [`phase4-codespace-wiring/`](./phase4-codespace-wiring/) to a
+github/github PR. No registry/GHCR token: the ~40s snapshot build runs in
+`onCreateCommand` and is **baked into the prebuild image** (snapshot pinned to the
+prebuild commit ⇒ dev codespaces start with a near-empty dirty set). The four pieces:
+`build-loadstate-snapshot.sh` (on-create snapshot build, no-ops on any failure),
+`fetch-loadstate-binary.sh` (downloads the Linux fork binary from a darylcecile/sorbet
+release via the built-in `GITHUB_TOKEN` — no packages scope; vendoring is the fallback),
+the `on-create-command.sh` patch, and the `.vscode/run-sorbet` replacement. Ship the
+~246MB snapshot only (the 465MB kvstore isn't needed at load time). The only external
+action item is publishing the fork binary as a release asset (or vendoring it) — see
+that folder's README.
 
 ---
 
