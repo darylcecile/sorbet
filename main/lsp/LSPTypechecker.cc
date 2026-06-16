@@ -146,10 +146,23 @@ void LSPTypechecker::initialize(TaskQueue &queue, unique_ptr<core::GlobalState> 
     {
         const bool isIncremental = false;
         ErrorEpoch epoch(*errorReporter, updates.epoch, isIncremental, {});
-        auto errorFlusher = make_shared<ErrorFlusherLSP>(updates.epoch, errorReporter);
-        auto handler = InitKVStoreStrategy::build(*this->gs, std::move(kvstore));
-        auto [committed, _startingStratum] = runSlowPath(updates, handler, workers, errorFlusher, SlowPathMode::Init);
-        ENFORCE(committed);
+
+        // Phase 3 (issue #1): when a fully-resolved snapshot was loaded via --load-state, the workspace symbol table
+        // is already populated, so we skip the full index+name+resolve+typecheck of every input file and adopt the
+        // loaded resolved state directly. Files that changed relative to the snapshot are re-typechecked by a normal
+        // edit (the existing fast/slow path) after initialization. Restricted to non-package mode for now; anything
+        // else falls back to the standard slow-path initialization (no behavior change).
+        const bool initFromSnapshot = !currentConfig.opts.loadState.empty() &&
+                                      !currentConfig.opts.packageDirected &&
+                                      !currentConfig.opts.cacheSensitiveOptions.sorbetPackages;
+        if (initFromSnapshot) {
+            initializeFromSnapshot(std::move(kvstore), currentConfig);
+        } else {
+            auto errorFlusher = make_shared<ErrorFlusherLSP>(updates.epoch, errorReporter);
+            auto handler = InitKVStoreStrategy::build(*this->gs, std::move(kvstore));
+            auto [committed, _startingStratum] = runSlowPath(updates, handler, workers, errorFlusher, SlowPathMode::Init);
+            ENFORCE(committed);
+        }
         epoch.committed = true;
     }
 
@@ -168,6 +181,39 @@ void LSPTypechecker::initialize(TaskQueue &queue, unique_ptr<core::GlobalState> 
     }
 
     config->logger->error("Resuming");
+}
+
+void LSPTypechecker::initializeFromSnapshot(unique_ptr<KeyValueStore> kvstore,
+                                            const LSPConfiguration &currentConfig) {
+    ENFORCE(this_thread::get_id() == typecheckerThreadId, "Typechecker can only be used from the typechecker thread.");
+    ENFORCE(!this->initialized);
+    Timer timeit(config->logger, "initialize_from_snapshot");
+
+    // The loaded GlobalState already contains every workspace file (source + FileHash) and a fully-resolved symbol
+    // table, so there is nothing to index, name, or resolve here. We only reconstruct the bookkeeping that a
+    // successful runSlowPath(Init) would otherwise leave behind:
+
+    // 1. The list of workspace files. reserveFiles looks each input path up in the (already populated) file table and
+    //    returns the existing FileRef, so this does not read or re-enter any file.
+    this->workspaceFiles = pipeline::reserveFiles(*this->gs, currentConfig.opts.inputFileNames);
+
+    // 2. The stratum assignment. In non-package mode (the only mode we take this path in) this is a single stratum
+    //    covering every file; no indexing is required to compute it.
+    vector<ast::ParsedFile> noPackageFiles;
+    auto workspaceFilesSpan = absl::MakeSpan(this->workspaceFiles);
+    auto strata = pipeline::computePackageStrata(*this->gs, noPackageFiles, workspaceFilesSpan, currentConfig.opts);
+    const auto numStrata = strata.strata.size();
+    this->fileToStratum = move(strata.fileToStratum);
+    this->lastStratum = core::packages::Stratum(numStrata - 1);
+    this->gs->preallocateForStrata(numStrata);
+
+    // 3. A session-private copy of the cache, exactly as the slow path makes one, so that any later cancelable slow
+    //    path (e.g. the fallback for a structural change) can reuse it. Tolerates a null kvstore, in which case a
+    //    later slow path re-reads sources from disk.
+    this->sessionCache =
+        cache::SessionCache::make(cache::ownIfUnchanged(*this->gs, std::move(kvstore)), *config->logger, config->opts);
+
+    this->initialized = true;
 }
 
 bool LSPTypechecker::typecheck(unique_ptr<LSPFileUpdates> updates, WorkerPool &workers,
